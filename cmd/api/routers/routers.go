@@ -4,6 +4,8 @@
 package routers
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +22,9 @@ import (
 	"github.com/kubearchive/kubearchive/pkg/database/interfaces"
 	labelFilter "github.com/kubearchive/kubearchive/pkg/models"
 	"github.com/kubearchive/kubearchive/pkg/observability"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/dynamic"
 )
 
 type CacheExpirations struct {
@@ -31,6 +35,7 @@ type CacheExpirations struct {
 type Controller struct {
 	Database           interfaces.DBReader
 	CacheConfiguration CacheExpirations
+	DynamicClient      dynamic.Interface
 }
 
 func (c *Controller) GetResources(context *gin.Context) {
@@ -111,13 +116,42 @@ func (c *Controller) GetResources(context *gin.Context) {
 	// Single resource by exact name - no streaming needed
 	if name != "" && !strings.Contains(name, "*") {
 		var resources []labelFilter.Resource
+
+		// When prunedFromEtcd is specified and we have a dynamic client,
+		// bypass the DB-level deletionTimestamp filter to also catch resources
+		// that are gone from the cluster but lack a deletionTimestamp.
+		dbPrunedFilter := prunedFromEtcd
+		if prunedFromEtcd != nil && c.DynamicClient != nil {
+			dbPrunedFilter = nil
+		}
+
 		resources, err = c.Database.QueryResources(
 			context.Request.Context(), kind, apiVersion, namespace, name, id, date, labelFilters,
-			creationTimestampAfter, creationTimestampBefore, prunedFromEtcd, 2)
+			creationTimestampAfter, creationTimestampBefore, dbPrunedFilter, 2)
 		if err != nil {
 			abort.Abort(context, err, http.StatusInternalServerError)
 			return
 		}
+
+		if prunedFromEtcd != nil && c.DynamicClient != nil && len(resources) > 0 {
+			var filtered []labelFilter.Resource
+			for _, r := range resources {
+				pruned, checkErr := c.isResourcePrunedFromCluster(
+					context.Request.Context(), r,
+					group, version, context.Param("resourceType"), namespace, name)
+				if checkErr != nil {
+					slog.WarnContext(context.Request.Context(),
+						"failed to check live cluster, falling back to deletionTimestamp",
+						"error", checkErr, "resource", name)
+					pruned = false
+				}
+				if pruned == *prunedFromEtcd {
+					filtered = append(filtered, r)
+				}
+			}
+			resources = filtered
+		}
+
 		if len(resources) == 0 {
 			abort.Abort(context, errors.New("resource not found"), http.StatusNotFound)
 			return
@@ -330,4 +364,30 @@ func (c *Controller) Readyz(context *gin.Context) {
 		return
 	}
 	context.JSON(http.StatusOK, gin.H{"message": "ready"})
+}
+
+func (c *Controller) isResourcePrunedFromCluster(ctx context.Context, resource labelFilter.Resource,
+	group, version, resourceType, namespace, name string) (bool, error) {
+	var obj unstructured.Unstructured
+	if err := json.Unmarshal([]byte(resource.Data), &obj); err != nil {
+		return false, fmt.Errorf("unmarshaling resource data: %w", err)
+	}
+
+	if obj.GetDeletionTimestamp() != nil {
+		return true, nil
+	}
+
+	// TODO(human): Use c.DynamicClient to check if the resource exists on the live cluster.
+	// Build a schema.GroupVersionResource from group, version, resourceType.
+	// Use .Namespace(namespace).Get(ctx, name, metav1.GetOptions{}).
+	// Return true if not found (errs.IsNotFound), false if found, or error otherwise.
+	// Imports needed: "k8s.io/apimachinery/pkg/runtime/schema",
+	// errs "k8s.io/apimachinery/pkg/api/errors", metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	if c.DynamicClient != nil {
+		if c.DynamicClient.Resource(resource).Namespace(name).Get(ctx, name, metav1.GetOptions{}) != nil {
+			return false, nil
+		}
+	}
+	return false, nil
 }

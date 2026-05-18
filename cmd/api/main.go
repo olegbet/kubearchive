@@ -145,11 +145,22 @@ func main() {
 		}
 	}(db)
 
-	controller := routers.Controller{Database: db, CacheConfiguration: *cacheExpirations}
 	k8sClient, err := k8sclient.NewInstrumentedKubernetesClient()
 	if err != nil {
 		slog.Error("Could not create instrumented kubernetes client", "error", err.Error())
 		os.Exit(1)
+	}
+
+	dynamicClient, err := k8sclient.NewInstrumentedDynamicClient()
+	if err != nil {
+		slog.Error("Could not create instrumented dynamic kubernetes client", "error", err.Error())
+		os.Exit(1)
+	}
+
+	controller := routers.Controller{
+		Database:           db,
+		CacheConfiguration: *cacheExpirations,
+		DynamicClient:      dynamicClient,
 	}
 
 	server := NewServer(k8sClient, controller, memCache, cacheExpirations)
